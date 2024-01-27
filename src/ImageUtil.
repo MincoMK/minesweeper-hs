@@ -1,0 +1,180 @@
+module ImageUtil (toImage, loadTexture) where
+
+import           Control.Monad
+import           Control.Monad.IO.Class (MonadIO(liftIO))
+import           Data.ByteString        (ByteString)
+import qualified Data.ByteString        as B
+import qualified Data.ByteString.Char8  as B8
+import           Data.List              (intercalate, isSuffixOf)
+import           Data.Vector.Storable   (Vector)
+import qualified Data.Vector.Storable   as V
+import           Foreign.C.String
+import           Foreign.Marshal.Alloc
+import           Foreign.Ptr
+import           Foreign.Storable
+import           Graphics.GL
+import           Graphics.UI.GLFW
+import           Prelude                hiding (init)
+import           System.Exit
+import Codec.Picture
+import           Codec.Picture.Extra    (flipVertically)
+import           Codec.Picture.Types
+import qualified Codec.Picture.Types    as CPTI
+import Data.Word (Word8)
+
+type VXO = Ptr GLuint
+type Tex = Ptr GLuint
+
+verts :: Vector Float
+verts = V.fromList
+  [ -0.5, -0.5, 1.0, 0.0
+  ,  0.5, -0.5, 0.0, 0.0
+  ,  0.5,  0.5, 0.0, 1.0
+  ,  0.5,  0.5, 0.0, 1.0
+  , -0.5, -0.5, 1.0, 0.0
+  , -0.5,  0.5, 1.0, 1.0
+  ]
+
+initGL :: IO ()
+initGL = do
+  init
+  maybeWindow <- createWindow 800 800 "Minesweeper" Nothing Nothing
+  case maybeWindow of
+    Nothing -> do
+      putStrLn "Failed to create GLFW window"
+      err <- getError
+      forM_ err print
+      terminate
+      exitFailure
+    Just window -> do
+      initWindow window
+
+initWindow :: Window -> IO ()
+initWindow window = do
+  makeContextCurrent (Just window)
+  shaderProgram <- createShaderProgram
+  initBuffers $ \vaoPtr vboPtr ->
+    forever $ do
+      shouldClose <- windowShouldClose window
+      if shouldClose
+        then do
+          glDeleteBuffers 1 vboPtr
+          glDeleteVertexArrays 1 vaoPtr
+          glDeleteProgram shaderProgram
+          terminate
+          exitSuccess
+        else do
+          textureLoc <- glGetUniformLocation shaderProgram =<< newCString "texture1"
+          glActiveTexture GL_TEXTURE0
+          loadTexture "img/test.png" $ \texture -> do
+            glBindTexture GL_TEXTURE_2D =<< peek texture
+            glUniform1i textureLoc 0
+            render shaderProgram vaoPtr window
+            swapBuffers window
+            pollEvents
+
+loadTexture :: FilePath -> (Tex -> IO ()) ->IO ()
+loadTexture path f = do
+  alloca $ \texturePtr -> do
+    glGenTextures 1 texturePtr
+    glBindTexture GL_TEXTURE_2D =<< peek texturePtr 
+    glTexParameteri GL_TEXTURE_2D GL_TEXTURE_WRAP_S GL_REPEAT
+    glTexParameteri GL_TEXTURE_2D GL_TEXTURE_WRAP_T GL_REPEAT
+    glTexParameteri GL_TEXTURE_2D GL_TEXTURE_MIN_FILTER GL_LINEAR
+    glTexParameteri GL_TEXTURE_2D GL_TEXTURE_MAG_FILTER GL_LINEAR
+    bytes <- B.readFile path
+    let typ | ".png" `isSuffixOf` path = GL_RGBA | otherwise = GL_RGB
+    toImage path bytes $ \ptr w h -> do
+      glTexImage2D GL_TEXTURE_2D 0 (fromIntegral typ) w h 0 typ GL_UNSIGNED_BYTE (castPtr ptr)
+      glGenerateMipmap GL_TEXTURE_2D
+      f texturePtr
+
+toImage :: String -> ByteString -> (Ptr Word8 -> GLint -> GLint -> IO ()) -> IO ()
+toImage name bytes go =
+  case decodeImage bytes of
+    Right (ImageYCbCr8 i) ->
+      V.unsafeWith (imageData (convertImage i :: CPTI.Image PixelRGB8)) $ \ptr ->
+        go ptr (fromIntegral $ imageWidth i) (fromIntegral $ imageHeight i)
+    Right (ImageRGBA8 i) ->
+      V.unsafeWith (imageData (flipVertically $ (convertImage i :: CPTI.Image PixelRGBA8))) $ \ptr ->
+        go ptr (fromIntegral $ imageWidth i) (fromIntegral $ imageHeight i)
+    _ -> do
+      putStrLn $ "Failed to load texture " ++ name
+      exitFailure
+
+createShaderProgram :: IO GLuint
+createShaderProgram = do
+  vertexShader <- glCreateShader GL_VERTEX_SHADER
+  fragmentShader <- glCreateShader GL_FRAGMENT_SHADER
+  shaderProgram <- glCreateProgram
+  compileShader vertexShader =<< getVertexShaderSource
+  compileShader fragmentShader =<< getFragmentShaderSource
+  glAttachShader shaderProgram vertexShader
+  glAttachShader shaderProgram fragmentShader
+  glLinkProgram shaderProgram
+  glDeleteShader vertexShader
+  glDeleteShader fragmentShader
+  return shaderProgram
+
+getVertexShaderSource :: IO String
+getVertexShaderSource = readFile "shaders/vertex.glsl"
+
+getFragmentShaderSource :: IO String
+getFragmentShaderSource = readFile "shaders/fragment.glsl"
+
+compileShader :: GLuint -> String -> IO ()
+compileShader shader source = do
+  putStrLn "Compiling shader"
+  shaderSource <- newCString source
+  alloca $ \shadersStr -> do
+    shadersStr `poke` shaderSource
+    glShaderSource shader 1 shadersStr nullPtr
+    glCompileShader shader
+    checkCompileErrors shader
+
+checkCompileErrors :: GLuint -> IO ()
+checkCompileErrors shader = do
+  alloca $ \successPtr ->
+    alloca $ \infoLogPtr -> do
+      glGetShaderiv shader GL_COMPILE_STATUS successPtr
+      success <- peek successPtr
+      when (success == GL_FALSE) $ do
+        glGetShaderInfoLog shader 512 nullPtr infoLogPtr
+        infoLog <- peekCString infoLogPtr
+        putStrLn infoLog
+  return ()
+
+render :: GLuint -> Ptr GLuint -> Window -> IO ()
+render shaderProgram vaoPtr window = do
+  vao <- peek vaoPtr
+  glClearColor 0.2 0.3 0.3 1.0
+  glClear GL_COLOR_BUFFER_BIT
+  glUseProgram shaderProgram
+  glBindVertexArray vao
+  let vertCount = fromIntegral (V.length verts) `div` 3
+  glDrawArrays GL_TRIANGLES 0 vertCount
+
+initBuffers :: (VXO -> VXO -> IO ()) -> IO ()
+initBuffers f = do
+  alloca $ \vaoPtr -> do
+    alloca $ \vboPtr -> do
+      glGenVertexArrays 1 vaoPtr
+      glGenBuffers 1 vboPtr
+      peek vaoPtr >>= glBindVertexArray
+      peek vboPtr >>= glBindBuffer GL_ARRAY_BUFFER
+      V.unsafeWith verts $ \vertsPtr ->
+        glBufferData
+          GL_ARRAY_BUFFER
+          (fromIntegral (V.length verts * sizeOf (undefined :: Float)))
+          (castPtr vertsPtr)
+          GL_STATIC_DRAW
+      glVertexAttribPointer 0 2 GL_FLOAT GL_FALSE (fromIntegral (4 * sizeOf (undefined :: Float))) nullPtr
+      glEnableVertexAttribArray 0
+      glVertexAttribPointer 1 2 GL_FLOAT GL_FALSE (fromIntegral $ 4 * sizeOf (undefined :: Float)) $ plusPtr nullPtr (2 * sizeOf (undefined :: Float))
+      glEnableVertexAttribArray 1
+      glBindBuffer GL_ARRAY_BUFFER 0
+      glBindVertexArray 0
+      f vaoPtr vboPtr
+
+main :: IO ()
+main = initGL
